@@ -1,0 +1,237 @@
+import { useQuery } from "@tanstack/react-query";
+import { supabase } from "@/integrations/supabase/client";
+import type { Json } from "@/integrations/supabase/types";
+
+export interface ActiveProgramRoutine {
+  id: string;
+  routine_id: string;
+  orden: number;
+  custom_data: Json | null;
+  routine: {
+    id: string;
+    nombre: string;
+    descripcion: string | null;
+    categoria: string;
+    dificultad: string;
+    portada_url: string | null;
+  } | null;
+  // Computed: has the user completed this routine?
+  isCompleted: boolean;
+}
+
+export interface ActiveProgramWeek {
+  id: string;
+  week_number: number;
+  routines: ActiveProgramRoutine[];
+  // Computed
+  isCompleted: boolean;
+  completedCount: number;
+}
+
+export interface ActiveProgram {
+  id: string;
+  nombre: string;
+  descripcion: string | null;
+  portada_url: string | null;
+  duracion_semanas: number;
+  weeks: ActiveProgramWeek[];
+  // Computed
+  currentWeek: number;
+  totalWeeks: number;
+  completedWeeks: number;
+  /** True if this is an admin-assigned (personalized) program */
+  isAssigned: boolean;
+}
+
+/**
+ * Fetches the active assigned program for the current user.
+ * Determines current week based on completed routines.
+ */
+export function useActiveProgram() {
+  return useQuery({
+    queryKey: ["active-program"],
+    queryFn: async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return null;
+
+      // First check for user-enrolled program (active status only)
+      // Get the most recently enrolled active program
+      const { data: enrollment } = await supabase
+        .from("user_programs")
+        .select("program_id, start_week, current_week, status, enrolled_at")
+        .eq("user_id", user.id)
+        .eq("status", "active")
+        .order("enrolled_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      let programId: string | null = null;
+      let enrollmentStartWeek = 1;
+      let enrolledAt: string | null = null;
+      let isAssigned = false;
+
+      if (enrollment) {
+        programId = enrollment.program_id;
+        enrollmentStartWeek = enrollment.start_week || 1;
+        enrolledAt = enrollment.enrolled_at;
+        isAssigned = false;
+      }
+      
+      if (!programId) {
+        // Fallback to admin-assigned program - but check if already completed in user_programs
+        const { data: assignedProgram } = await supabase
+          .from("routines")
+          .select("id")
+          .eq("tipo", "programa")
+          .eq("assigned_user_id", user.id)
+          .eq("estado", "publicada")
+          .maybeSingle();
+
+        if (assignedProgram) {
+          // Check if this program was already completed
+          const { data: existingEnrollment } = await supabase
+            .from("user_programs")
+            .select("status")
+            .eq("user_id", user.id)
+            .eq("program_id", assignedProgram.id)
+            .maybeSingle();
+          
+          // Only show if not explicitly completed
+          if (!existingEnrollment || existingEnrollment.status !== "completed") {
+            programId = assignedProgram.id;
+            isAssigned = true;
+          }
+        }
+      }
+
+      if (!programId) return null;
+
+      // Fetch program details
+      const { data: program, error: programError } = await supabase
+        .from("routines")
+        .select("id, nombre, descripcion, portada_url, duracion_semanas")
+        .eq("id", programId)
+        .maybeSingle();
+
+      if (programError) throw programError;
+      if (!program) return null;
+
+      // Fetch weeks for this program
+      const { data: weeks, error: weeksError } = await supabase
+        .from("program_weeks")
+        .select("id, week_number")
+        .eq("program_id", program.id)
+        .order("week_number", { ascending: true });
+
+      if (weeksError) throw weeksError;
+      if (!weeks || weeks.length === 0) return null;
+
+      // Fetch week routines with routine details
+      const weekIds = weeks.map(w => w.id);
+      const { data: weekRoutines, error: wrError } = await supabase
+        .from("program_week_routines")
+        .select(`
+          id,
+          week_id,
+          routine_id,
+          orden,
+          custom_data,
+          routine:routines(id, nombre, descripcion, categoria, dificultad, portada_url)
+        `)
+        .in("week_id", weekIds)
+        .order("orden", { ascending: true });
+
+      if (wrError) throw wrError;
+
+      // Fetch user's completed routine events to determine progress
+      // Only count completions AFTER the enrollment date for this program run
+      let completedEventsQuery = supabase
+        .from("user_events")
+        .select("metadata, created_at")
+        .eq("user_id", user.id)
+        .eq("type", "entrenamiento")
+        .eq("status", "completed");
+      
+      // If we have an enrollment date, only count events after it
+      if (enrolledAt) {
+        completedEventsQuery = completedEventsQuery.gte("created_at", enrolledAt);
+      }
+      
+      const { data: completedEvents, error: eventsError } = await completedEventsQuery;
+
+      if (eventsError) throw eventsError;
+
+      // Build a map of routine completion counts (same routine can appear multiple times)
+      const routineCompletionCounts = new Map<string, number>();
+      for (const event of completedEvents || []) {
+        const routineId = (event.metadata as any)?.routine_id;
+        if (routineId) {
+          routineCompletionCounts.set(routineId, (routineCompletionCounts.get(routineId) || 0) + 1);
+        }
+      }
+
+      // Build weeks with completion status
+      // Track how many times each routine has been "used" for completion
+      const usedCompletions = new Map<string, number>();
+      
+      const builtWeeks: ActiveProgramWeek[] = weeks.map(week => {
+        const routines = (weekRoutines || [])
+          .filter(wr => wr.week_id === week.id)
+          .map(wr => {
+            const totalCompletions = routineCompletionCounts.get(wr.routine_id) || 0;
+            const usedCount = usedCompletions.get(wr.routine_id) || 0;
+            const isCompleted = usedCount < totalCompletions;
+            
+            // Mark this completion as "used"
+            if (isCompleted) {
+              usedCompletions.set(wr.routine_id, usedCount + 1);
+            }
+            
+            return {
+              id: wr.id,
+              routine_id: wr.routine_id,
+              orden: wr.orden,
+              custom_data: wr.custom_data,
+              routine: wr.routine as ActiveProgramRoutine["routine"],
+              isCompleted,
+            };
+          });
+
+        const completedCount = routines.filter(r => r.isCompleted).length;
+
+        return {
+          id: week.id,
+          week_number: week.week_number,
+          routines,
+          completedCount,
+          isCompleted: routines.length > 0 && completedCount === routines.length,
+        };
+      });
+
+      // Determine current week: first incomplete week, or last week if all complete
+      let currentWeek = 1;
+      for (const week of builtWeeks) {
+        if (!week.isCompleted) {
+          currentWeek = week.week_number;
+          break;
+        }
+        currentWeek = week.week_number;
+      }
+
+      const completedWeeks = builtWeeks.filter(w => w.isCompleted).length;
+
+      return {
+        id: program.id,
+        nombre: program.nombre,
+        descripcion: program.descripcion,
+        portada_url: program.portada_url,
+        duracion_semanas: program.duracion_semanas || weeks.length,
+        weeks: builtWeeks,
+        currentWeek,
+        totalWeeks: weeks.length,
+        completedWeeks,
+        isAssigned,
+      } as ActiveProgram;
+    },
+  });
+}
