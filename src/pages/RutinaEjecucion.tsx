@@ -1,0 +1,533 @@
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { Loader2, AlertCircle, Lock, UserPlus, CreditCard } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { useRoutine } from "@/hooks/useRoutines";
+import { useWorkoutExecution } from "@/hooks/useWorkoutExecution";
+import { useUserAccess } from "@/hooks/useUserAccess";
+import { useUserProfile } from "@/hooks/useUserProfile";
+import { useActiveProgram } from "@/hooks/useActiveProgram";
+import { supabase } from "@/integrations/supabase/client";
+import { WorkoutCountdown } from "@/components/workout/WorkoutCountdown";
+import { WorkoutExercise } from "@/components/workout/WorkoutExercise";
+import { WorkoutRest } from "@/components/workout/WorkoutRest";
+import { WorkoutComplete } from "@/components/workout/WorkoutComplete";
+import { useAuth } from "@/hooks/useAuth";
+// Audio context singleton for sounds - configured to mix with external music
+let audioContextInstance: AudioContext | null = null;
+
+function getAudioContext() {
+  if (typeof window === "undefined") return null;
+  if (!audioContextInstance) {
+    // Create AudioContext that doesn't interrupt other audio sources
+    // Using 'playback' latencyHint for short sound effects that mix with music
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    audioContextInstance = new AudioContextClass({
+      latencyHint: 'playback', // Optimized for sound effects, not interrupting
+    });
+  }
+  // Resume if suspended (required for user gesture on mobile)
+  if (audioContextInstance.state === 'suspended') {
+    audioContextInstance.resume().catch(() => {});
+  }
+  return audioContextInstance;
+}
+
+// Buzzer sound - plays on countdown (3, 2, 1) - short effect that mixes with music
+function createBuzzerSound() {
+  return () => {
+    const audioContext = getAudioContext();
+    if (!audioContext) return;
+    
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    oscillator.frequency.value = 800; // Hz - medium tone
+    oscillator.type = "sine";
+    
+    // Short duration, moderate volume to blend with external music
+    gainNode.gain.setValueAtTime(0.25, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.15);
+    
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + 0.15);
+  };
+}
+
+// Beep sound - plays when exercise starts (higher pitch, distinct) - short effect
+function createBeepSound() {
+  return () => {
+    const audioContext = getAudioContext();
+    if (!audioContext) return;
+    
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    oscillator.frequency.value = 1200; // Hz - higher tone than buzzer
+    oscillator.type = "sine";
+    
+    // Short duration effect that mixes with background music
+    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.12);
+    
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + 0.12);
+  };
+}
+
+export default function RutinaEjecucion() {
+  const navigate = useNavigate();
+  const { id } = useParams();
+  const { user } = useAuth();
+  const { level: accessLevel, isGuest, canAccessFullContent, isLoading: accessLoading } = useUserAccess();
+  const { data: routine, isLoading, error } = useRoutine(id);
+  const { data: userProfile } = useUserProfile();
+  const { data: activeProgram } = useActiveProgram();
+  
+  const [workoutStarted, setWorkoutStarted] = useState(false);
+  const [showPaywall, setShowPaywall] = useState(false);
+  const buzzerRef = useRef<(() => void) | null>(null);
+  const beepRef = useRef<(() => void) | null>(null);
+
+  // Determine if this routine is part of the active program and program completion status
+  const programContext = useMemo(() => {
+    if (!activeProgram || !id) {
+      return { isPartOfProgram: false, isProgramComplete: false, programName: undefined, isAssigned: false };
+    }
+
+    // Check if this routine is part of any week in the active program
+    let routineFoundInProgram = false;
+    let totalRoutinesInProgram = 0;
+    let completedRoutinesInProgram = 0;
+
+    for (const week of activeProgram.weeks) {
+      for (const weekRoutine of week.routines) {
+        totalRoutinesInProgram++;
+        if (weekRoutine.isCompleted) {
+          completedRoutinesInProgram++;
+        }
+        if (weekRoutine.routine_id === id) {
+          routineFoundInProgram = true;
+        }
+      }
+    }
+
+    if (!routineFoundInProgram) {
+      return { isPartOfProgram: false, isProgramComplete: false, programName: undefined, isAssigned: false };
+    }
+
+    // Check if completing this routine will complete the entire program
+    const isProgramComplete = completedRoutinesInProgram === totalRoutinesInProgram - 1;
+
+    return {
+      isPartOfProgram: true,
+      isProgramComplete,
+      programName: activeProgram.nombre,
+      isAssigned: activeProgram.isAssigned,
+    };
+  }, [activeProgram, id]);
+
+  // Initialize sounds
+  useEffect(() => {
+    buzzerRef.current = createBuzzerSound();
+    beepRef.current = createBeepSound();
+  }, []);
+
+  const playBuzzer = useCallback(() => {
+    try {
+      buzzerRef.current?.();
+    } catch (e) {
+      console.log("Could not play buzzer sound");
+    }
+  }, []);
+
+  const playBeep = useCallback(() => {
+    try {
+      beepRef.current?.();
+    } catch (e) {
+      console.log("Could not play beep sound");
+    }
+  }, []);
+
+  // Save workout completion to database
+  const handleWorkoutComplete = useCallback(async () => {
+    if (!user || !routine) return;
+
+    try {
+      // Create a completed entrenamiento event
+      const today = new Date().toISOString().split("T")[0];
+      
+      // Build metadata - include program info if this routine is part of a program
+      const eventMetadata: {
+        routine_id: string;
+        routine_name: string;
+        routine_category: string;
+        routine_cover_url: string | null;
+        source?: string;
+        program_id?: string;
+        program_name?: string;
+      } = {
+        routine_id: routine.id,
+        routine_name: routine.nombre,
+        routine_category: routine.categoria,
+        routine_cover_url: routine.portada_url,
+      };
+
+      // Add program info if applicable
+      if (programContext.isPartOfProgram && activeProgram) {
+        eventMetadata.source = "program";
+        eventMetadata.program_id = activeProgram.id;
+        eventMetadata.program_name = activeProgram.nombre;
+      }
+      
+      await supabase.from("user_events").insert([{
+        user_id: user.id,
+        type: "entrenamiento",
+        event_date: today,
+        status: "completed",
+        title: routine.nombre,
+        metadata: eventMetadata,
+      }]);
+
+      // Update routine's veces_realizada counter
+      await supabase
+        .from("routines")
+        .update({ veces_realizada: (routine.veces_realizada || 0) + 1 })
+        .eq("id", routine.id);
+
+    } catch (error) {
+      console.error("Error saving workout completion:", error);
+    }
+  }, [user, routine, programContext.isPartOfProgram, activeProgram]);
+
+  const handleExit = useCallback(() => {
+    navigate(`/rutina/${id}`);
+  }, [navigate, id]);
+
+
+  const {
+    currentStep,
+    timeRemaining,
+    isPaused,
+    isComplete,
+    totalDots,
+    dotsByBlock,
+    currentDotIndex,
+    canGoBack,
+    canGoForward,
+    start,
+    pause,
+    resume,
+    skipRest,
+    goBack,
+    goForward,
+    exit,
+  } = useWorkoutExecution(
+    workoutStarted ? routine : null,
+    handleWorkoutComplete,
+    handleExit
+  );
+
+  // Handle early finish - don't save anything, just redirect to routine preview
+  const handleFinishEarly = useCallback(() => {
+    exit();
+    navigate(`/rutina/${id}`);
+  }, [exit, navigate, id]);
+
+  // Auto-start workout when started flag is set
+  useEffect(() => {
+    if (workoutStarted && currentStep?.type === "countdown") {
+      start();
+    }
+  }, [workoutStarted, currentStep?.type, start]);
+
+  // For registered users: show paywall when transitioning from countdown to exercise
+  useEffect(() => {
+    if (!canAccessFullContent && workoutStarted && currentStep?.type === "exercise") {
+      setShowPaywall(true);
+    }
+  }, [canAccessFullContent, workoutStarted, currentStep?.type]);
+
+  // Loading state
+  if (isLoading || accessLoading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  // Block guests - must register
+  if (isGuest) {
+    return (
+      <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
+        <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mb-4">
+          <UserPlus className="w-8 h-8 text-primary" />
+        </div>
+        <h1 className="text-xl font-semibold text-foreground mb-2 text-center">
+          Crea tu cuenta para entrenar
+        </h1>
+        <p className="text-muted-foreground text-center mb-6">
+          Regístrate gratis para acceder a las rutinas de entrenamiento.
+        </p>
+        <div className="flex flex-col gap-2 w-full max-w-xs">
+          <Button onClick={() => navigate("/login", { state: { mode: "signup" } })}>
+            Crear cuenta
+          </Button>
+          <Button variant="outline" onClick={() => navigate("/login")}>
+            Iniciar sesión
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // Show paywall for registered users when they try to start the actual exercise
+  // This is triggered after the countdown ends
+  if (!canAccessFullContent && showPaywall) {
+    return (
+      <div className="fixed inset-0 z-50 bg-black flex flex-col">
+        {/* Video Background */}
+        <div className="absolute inset-0">
+          {routine?.blocks?.[0]?.exercises?.[0]?.exercise?.video_url ? (
+            <video
+              src={routine.blocks[0].exercises[0].exercise.video_url}
+              autoPlay
+              loop
+              muted
+              playsInline
+              className="w-full h-full object-cover"
+              poster={routine.blocks[0].exercises[0].exercise.thumbnail_url || undefined}
+            />
+          ) : (
+            <div className="w-full h-full bg-gradient-to-b from-background to-card" />
+          )}
+          <div className="absolute inset-0 bg-black/80" />
+        </div>
+
+        {/* Paywall Content */}
+        <div className="relative z-10 flex flex-col items-center justify-center flex-1 px-6 text-center">
+          <div className="w-20 h-20 rounded-full bg-warning/20 flex items-center justify-center mb-6">
+            <Lock className="w-10 h-10 text-warning" />
+          </div>
+          
+          <h2 className="text-2xl font-bold text-white mb-3">
+            Para entrenar completo necesitas suscripción
+          </h2>
+          
+          <p className="text-white/70 mb-8 max-w-sm">
+            Accede a todas las rutinas, programas y funciones premium con tu suscripción.
+          </p>
+
+          <div className="flex flex-col gap-3 w-full max-w-xs">
+            <Button
+              size="lg"
+              className="h-14 text-lg"
+              onClick={() => navigate("/configuracion")}
+            >
+              <CreditCard className="w-5 h-5 mr-2" />
+              Suscribirme
+            </Button>
+            
+            <Button
+              variant="outline"
+              size="lg"
+              className="h-12 bg-white/10 border-white/20 text-white hover:bg-white/20"
+              onClick={() => navigate(`/rutina/${id}`)}
+            >
+              Ver preview
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Error or not found state
+  if (error || !routine) {
+    return (
+      <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
+        <AlertCircle className="w-12 h-12 text-destructive mb-4" />
+        <h1 className="text-xl font-semibold text-foreground mb-2">
+          Rutina no encontrada
+        </h1>
+        <p className="text-muted-foreground text-center mb-6">
+          La rutina que buscas no existe o ha sido eliminada.
+        </p>
+        <Button onClick={() => navigate(-1)}>Volver</Button>
+      </div>
+    );
+  }
+
+  // Not started yet - show initial countdown screen
+  if (!workoutStarted) {
+    const firstExercise = routine.blocks?.[0]?.exercises?.[0]?.exercise;
+    
+    return (
+      <div className="fixed inset-0 z-50 bg-black flex flex-col">
+        {/* Video Background */}
+        <div className="absolute inset-0">
+          {firstExercise?.video_url ? (
+            <video
+              src={firstExercise.video_url}
+              autoPlay
+              loop
+              muted
+              playsInline
+              className="w-full h-full object-cover"
+              poster={firstExercise.thumbnail_url || undefined}
+            />
+          ) : firstExercise?.thumbnail_url ? (
+            <img
+              src={firstExercise.thumbnail_url}
+              alt={firstExercise.nombre || "Exercise"}
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            <div className="w-full h-full bg-gradient-to-b from-background to-card" />
+          )}
+          <div className="absolute inset-0 bg-black/60" />
+        </div>
+
+        {/* Content */}
+        <div className="relative z-10 flex flex-col items-center justify-center flex-1 px-4 text-center">
+          <p className="text-sm text-white/70 font-medium mb-2">
+            {routine.blocks?.[0]?.nombre || "Bloque 1"}
+          </p>
+          
+          <h2 className="text-2xl font-bold text-white mb-4">
+            {firstExercise?.nombre || "Primer ejercicio"}
+          </h2>
+
+          <p className="text-lg text-white/60 mb-8">
+            ¿Listo para comenzar?
+          </p>
+
+          <Button
+            size="lg"
+            className="rounded-full px-12 h-14 text-lg"
+            onClick={() => setWorkoutStarted(true)}
+          >
+            Comenzar
+          </Button>
+        </div>
+
+        {/* Exit button */}
+        <button
+          onClick={handleExit}
+          className="absolute top-4 left-4 z-20 w-10 h-10 flex items-center justify-center rounded-full bg-black/40 backdrop-blur-sm text-white hover:bg-black/60 transition-colors"
+        >
+          ✕
+        </button>
+      </div>
+    );
+  }
+
+  // Workout complete
+  if (isComplete) {
+    return (
+      <WorkoutComplete
+        routineName={routine.nombre}
+        routineId={routine.id}
+        routineObjetivo={routine.objetivo as unknown as Record<string, number> | null}
+        isPartOfProgram={programContext.isPartOfProgram}
+        isProgramComplete={programContext.isProgramComplete}
+        programName={programContext.programName}
+        isAssignedProgram={programContext.isAssigned}
+      />
+    );
+  }
+
+  // Render current step
+  if (!currentStep) return null;
+
+  const totalBlocks = routine.blocks?.length || 1;
+
+  switch (currentStep.type) {
+    case "countdown":
+      return (
+        <WorkoutCountdown
+          seconds={timeRemaining}
+          exerciseName={currentStep.exercise?.nombre}
+          blockName={currentStep.blockName}
+          videoUrl={currentStep.exercise?.video_url}
+          thumbnailUrl={currentStep.exercise?.thumbnail_url}
+          onPlayBuzzer={playBuzzer}
+        />
+      );
+
+    case "exercise":
+      return (
+        <WorkoutExercise
+          exerciseName={currentStep.exercise?.nombre || "Ejercicio"}
+          blockName={currentStep.blockName}
+          blockIndex={currentStep.blockIndex}
+          totalBlocks={totalBlocks}
+          timeRemaining={timeRemaining}
+          tipoEjecucion={currentStep.tipoEjecucion}
+          repeticiones={currentStep.repeticiones}
+          videoUrl={currentStep.exercise?.video_url}
+          thumbnailUrl={currentStep.exercise?.thumbnail_url}
+          tips={currentStep.exercise?.tips}
+          comment={currentStep.comment}
+          isPaused={isPaused}
+          dotsByBlock={dotsByBlock}
+          currentDotIndex={currentDotIndex}
+          userGender={userProfile?.sex}
+          canGoBack={canGoBack}
+          canGoForward={canGoForward}
+          onPause={pause}
+          onResume={resume}
+          onGoBack={goBack}
+          onGoForward={goForward}
+          onExit={() => {
+            exit();
+            handleExit();
+          }}
+          onFinishEarly={handleFinishEarly}
+          onPlayBuzzer={playBuzzer}
+          onPlayBeep={playBeep}
+        />
+      );
+
+    case "rest-exercise":
+    case "rest-series":
+    case "rest-block":
+      return (
+        <WorkoutRest
+          type={currentStep.type}
+          timeRemaining={timeRemaining}
+          nextExerciseName={currentStep.nextExercise?.nombre}
+          nextBlockName={currentStep.type === "rest-block" ? currentStep.blockName : undefined}
+          seriesInfo={
+            currentStep.type === "rest-series"
+              ? `Serie ${currentStep.seriesIndex} de ${currentStep.totalSeries}`
+              : undefined
+          }
+          videoUrl={currentStep.nextExercise?.video_url}
+          thumbnailUrl={currentStep.nextExercise?.thumbnail_url}
+          isPaused={isPaused}
+          canGoBack={canGoBack}
+          onSkip={skipRest}
+          onPause={pause}
+          onResume={resume}
+          onGoBack={goBack}
+          onFinishEarly={handleFinishEarly}
+          onExit={() => {
+            exit();
+            handleExit();
+          }}
+          onPlayBuzzer={playBuzzer}
+        />
+      );
+
+    default:
+      return null;
+  }
+}
