@@ -30,6 +30,7 @@ export interface PlanInfo {
   paypalPlanId: string;
 }
 
+// Planes de suscripción con precios oficiales y IDs de Mercado Pago
 export const PLANS: PlanInfo[] = [
   {
     id: "globo",
@@ -186,7 +187,6 @@ export function useInitiatePayment() {
           body: {
             user_id: user.id,
             user_email: user.email,
-            plan_id: planInfo.mercadoPagoPlanId,
             plan: plan,
           },
         });
