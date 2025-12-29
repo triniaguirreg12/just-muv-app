@@ -192,7 +192,9 @@ export function useActiveProgram() {
               routine_id: wr.routine_id,
               orden: wr.orden,
               custom_data: wr.custom_data,
-              routine: wr.routine as ActiveProgramRoutine["routine"],
+              routine: (Array.isArray((wr as any).routine)
+                ? (wr as any).routine[0]
+                : (wr as any).routine) as ActiveProgramRoutine["routine"],
               isCompleted,
             };
           });
