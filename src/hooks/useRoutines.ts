@@ -287,7 +287,10 @@ export function usePublishedRoutines() {
       const blockIds = (blocks || []).map(b => b.id);
       let blockExercises: Array<{
         block_id: string;
-        exercise: { implementos: string[] | null; } | null;
+        exercise:
+          | { implementos: string[] | null }
+          | { implementos: string[] | null }[]
+          | null;
         tiempo: number | null;
         repeticiones: number | null;
         tipo_ejecucion: string;
